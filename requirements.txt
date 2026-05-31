@@ -1,1 +1,5 @@
 scipy
+# GeoCalib (single-image camera calibration) powers the "Estimate Camera" node.
+# Not on PyPI — install from git. The node lazy-imports it and prints a friendly
+# message if it's missing, so the rest of the pack works without it.
+geocalib @ git+https://github.com/cvg/GeoCalib

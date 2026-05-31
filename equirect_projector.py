@@ -154,9 +154,15 @@ def _torch_iterative_fill(frames: torch.Tensor, known_mask_2d: torch.Tensor, reg
 class RectilinearToEquirect:
     """Forward gnomonic projection: place a rectilinear view onto an equirect canvas.
 
-    Projects a perspective image/video onto a 2:1 equirectangular panorama at (yaw, pitch),
-    producing the distorted/padded equirect image plus an outpaint mask marking the
-    region for the diffusion model to generate.
+    Projects a perspective image/video onto a 2:1 equirectangular panorama at
+    (yaw, pitch, roll), producing the distorted/padded equirect image plus an
+    outpaint mask marking the region for the diffusion model to generate. The
+    input's native (de-letterboxed) aspect is preserved — no forced aspect crop.
+    FOV is set via `hfov_deg`, or via `focal_px` (e.g. from the GeoCalib
+    estimator) which takes precedence and is crop-invariant. `fov_scale` then
+    multiplies the resolved FOV: > 1 spreads a narrow/telephoto source over a
+    wider angle so it keeps more area/detail on the panorama (and lands in the
+    model's trained reference-FOV range), at the cost of exact geometry.
 
     `shape` options:
       - pincushion: raw forward-projection footprint (curved edges)
@@ -170,18 +176,25 @@ class RectilinearToEquirect:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "hfov_deg": ("FLOAT", {"default": 100.0, "min": 10.0, "max": 179.0, "step": 0.5}),
+                "hfov_deg": ("FLOAT", {"default": 90.0, "min": 10.0, "max": 179.0, "step": 0.5}),
+                "fov_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 5.0, "step": 0.05}),
                 "equirect_width": ("INT", {"default": 1920, "min": 64, "max": 8192, "step": 32}),
                 "equirect_height": ("INT", {"default": 960, "min": 32, "max": 4096, "step": 32}),
                 "yaw_deg": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0}),
                 "pitch_deg": ("FLOAT", {"default": 0.0, "min": -89.0, "max": 89.0, "step": 1.0}),
+                "roll_deg": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.5}),
                 "shape": (["pincushion", "inscribed_rect", "bounding_rect"], {"default": "pincushion"}),
                 "fill_value": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "feather_px": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
                 "strip_letterbox": ("BOOLEAN", {"default": True}),
                 "letterbox_threshold": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "crop_to_239": ("BOOLEAN", {"default": True}),
-                "crop_align": (["top", "center", "bottom"], {"default": "center"}),
+            },
+            "optional": {
+                # When > 0, used directly as the focal length in pixels (e.g. wired
+                # from the GeoCalib estimator). Crop-invariant, so it stays correct
+                # regardless of letterbox stripping. When 0, focal is derived from
+                # hfov_deg and the (de-letterboxed) input width.
+                "focal_px": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 1.0}),
             },
         }
 
@@ -190,18 +203,15 @@ class RectilinearToEquirect:
     FUNCTION = "project"
     CATEGORY = "360/projection"
 
-    def project(self, image, hfov_deg, equirect_width, equirect_height,
-                yaw_deg, pitch_deg, shape, fill_value, feather_px,
-                strip_letterbox=True, letterbox_threshold=0.06,
-                crop_to_239=True, crop_align="center"):
+    def project(self, image, hfov_deg, fov_scale, equirect_width, equirect_height,
+                yaw_deg, pitch_deg, roll_deg, shape, fill_value, feather_px,
+                strip_letterbox=True, letterbox_threshold=0.06, focal_px=0.0):
         device = image.device
         dtype = image.dtype
         if strip_letterbox and image.shape[0] > 0:
             t, b, l, r = _detect_content_bbox(image[0], float(letterbox_threshold))
             if (t, b, l, r) != (0, image.shape[1], 0, image.shape[2]):
                 image = image[:, t:b, l:r, :].contiguous()
-        if crop_to_239 and image.shape[0] > 0:
-            image = _crop_to_aspect(image, 2.39, crop_align)
         B, Hi, Wi, _ = image.shape
         Weq, Heq = int(equirect_width), int(equirect_height)
 
@@ -228,8 +238,28 @@ class RectilinearToEquirect:
         x = cos_lat * sin_dlon / cos_c_safe
         y = (cos_lat0 * sin_lat - sin_lat0 * cos_lat * cos_dlon) / cos_c_safe
 
-        # Tangent plane → rectilinear pixel coords
-        f = (Wi / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+        # Roll: rotate the tangent-plane footprint about the optical axis so a
+        # tilted-horizon source (nonzero camera roll) lands level on the panorama.
+        if roll_deg:
+            rr = math.radians(roll_deg)
+            cr, sr = math.cos(rr), math.sin(rr)
+            x, y = x * cr - y * sr, x * sr + y * cr
+
+        # Tangent plane → rectilinear pixel coords. focal_px (e.g. from GeoCalib)
+        # takes precedence; otherwise derive focal from hfov and the native width.
+        if focal_px and focal_px > 0:
+            f = float(focal_px)
+        else:
+            f = (Wi / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
+        # fov_scale > 1 deliberately spreads the footprint over a wider angle than
+        # the true FOV: trades exact geometry for a larger area on the panorama
+        # (so narrow/telephoto sources keep more detail at a given canvas size and
+        # land in the model's trained 70-130° reference range). Applied here, at
+        # the projection width, so it always means "scale the footprint FOV".
+        if fov_scale and fov_scale != 1.0:
+            hfov_cur = 2.0 * math.atan((Wi / 2.0) / f)
+            hfov_new = min(max(hfov_cur * float(fov_scale), 1e-3), math.radians(179.0))
+            f = (Wi / 2.0) / math.tan(hfov_new / 2.0)
         u_rect = x * f + (Wi - 1) / 2.0
         v_rect = -y * f + (Hi - 1) / 2.0
 
@@ -493,9 +523,107 @@ class EquirectSeamInpaintCompose:
         return (out,)
 
 
+# ---------------------------------------------------------------------------
+# Camera calibration (GeoCalib) — auto-estimate FOV / orientation from a frame
+# ---------------------------------------------------------------------------
+
+_GEOCALIB_MODELS = {}  # cache by weights name, avoids reloading the net every run
+
+
+def _get_geocalib(weights: str):
+    """Lazily import GeoCalib and load (and cache) a model on the best device.
+    Raises a friendly error if the library isn't installed."""
+    try:
+        from geocalib import GeoCalib
+    except ImportError as e:
+        raise ImportError(
+            "GeoCalib is not installed. Install it with:\n"
+            "    pip install git+https://github.com/cvg/GeoCalib"
+        ) from e
+    if weights not in _GEOCALIB_MODELS:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _GEOCALIB_MODELS[weights] = GeoCalib(weights=weights).to(device)
+    return _GEOCALIB_MODELS[weights]
+
+
+class EstimateCameraGeoCalib:
+    """Estimate camera FOV and orientation from a single frame using GeoCalib.
+
+    Reads one frame of an image/video batch (the first frame by default) and runs
+    single-image camera calibration. Wire the outputs into Rectilinear → Equirect
+    to auto-drive the projection: `focal_px` (or `hfov_deg`) sets the footprint
+    size, `pitch_deg` / `roll_deg` level the horizon.
+
+    Estimation runs on the FULL frame by default — GeoCalib uses the whole field
+    of view's perspective cues, so cropping the frame first throws the estimate
+    off (e.g. a dark sky read as a letterbox bar shrinks the frame and inflates
+    the focal length). Letterbox removal for the actual projection happens in the
+    prep node, not here. Only enable `strip_letterbox` if the source has hard
+    baked-in black bars; even then, GeoCalib tolerates mild bars, so prefer off.
+
+    Angles are in degrees; `focal_px` is the horizontal focal length in pixels of
+    the estimated frame — the most robust value to feed the prep node (it's the
+    camera intrinsic, so it stays valid when the prep node strips letterbox).
+    `first_frame` is the frame used (preview/debug; the prep node does not need it
+    — keep feeding it the original video).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "frame_index": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1}),
+                "weights": (["pinhole", "distorted"], {"default": "pinhole"}),
+                "camera_model": (["pinhole", "simple_radial", "simple_divisional"], {"default": "pinhole"}),
+                # Off by default: cropping before estimation corrupts the FOV.
+                # Only for sources with hard baked-in black bars.
+                "strip_letterbox": ("BOOLEAN", {"default": False}),
+                "letterbox_threshold": ("FLOAT", {"default": 0.06, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "IMAGE")
+    RETURN_NAMES = ("hfov_deg", "vfov_deg", "pitch_deg", "roll_deg", "focal_px", "first_frame")
+    FUNCTION = "estimate"
+    CATEGORY = "360/projection"
+
+    def estimate(self, image, frame_index, weights, camera_model,
+                 strip_letterbox=False, letterbox_threshold=0.06):
+        from geocalib.utils import rad2deg
+
+        if image.shape[0] == 0:
+            raise ValueError("EstimateCameraGeoCalib: empty image batch")
+        idx = max(0, min(int(frame_index), image.shape[0] - 1))
+        frame = image[idx]  # (H, W, C)
+
+        if strip_letterbox:
+            t, b, l, r = _detect_content_bbox(frame, float(letterbox_threshold))
+            frame = frame[t:b, l:r, :].contiguous()
+
+        model = _get_geocalib(weights)
+        device = next(model.parameters()).device
+        img_chw = frame.permute(2, 0, 1).to(device=device, dtype=torch.float32)
+
+        with torch.inference_mode():
+            results = model.calibrate(img_chw, camera_model=camera_model)
+
+        camera = results["camera"]
+        gravity = results["gravity"]
+
+        hfov = float(rad2deg(camera.hfov).reshape(-1)[0].item())
+        vfov = float(rad2deg(camera.vfov).reshape(-1)[0].item())
+        focal_px = float(camera.f.reshape(-1)[0].item())  # fx, in pixels of `frame`
+        rp = rad2deg(gravity.rp).reshape(-1)  # [roll, pitch] in degrees
+        roll = float(rp[0].item())
+        pitch = float(rp[1].item())
+
+        first_frame = frame.unsqueeze(0).to(dtype=image.dtype, device=image.device)
+        return (hfov, vfov, pitch, roll, focal_px, first_frame)
 
 
 NODE_CLASS_MAPPINGS = {
+    "EstimateCameraGeoCalib": EstimateCameraGeoCalib,
     "RectilinearToEquirect": RectilinearToEquirect,
     "EquirectSeamInpaintPrep": EquirectSeamInpaintPrep,
     "EquirectSeamInpaintExport": EquirectSeamInpaintExport,
@@ -503,6 +631,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "EstimateCameraGeoCalib": "Estimate Camera (GeoCalib)",
     "RectilinearToEquirect": "Rectilinear → Equirect (360 outpaint prep)",
     "EquirectSeamInpaintPrep": "Equirect Seam Inpaint Prep",
     "EquirectSeamInpaintExport": "Equirect Seam Inpaint Export",
