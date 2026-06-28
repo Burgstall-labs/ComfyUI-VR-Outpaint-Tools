@@ -1,4 +1,4 @@
-# ComfyUI-EquirectProjector
+# ComfyUI-VR-Outpaint-Tools
 
 ComfyUI custom nodes for working with 360° equirectangular (ERP) imagery and
 video. Built primarily for the **LTX2.3 VR-Outpaint** model; may work with
@@ -14,8 +14,8 @@ other ERP-aware diffusion / video models too.
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/Burgstall-labs/ComfyUI-EquirectProjector
-cd ComfyUI-EquirectProjector
+git clone https://github.com/Burgstall-labs/ComfyUI-VR-Outpaint-Tools
+cd ComfyUI-VR-Outpaint-Tools
 pip install -r requirements.txt
 ```
 
