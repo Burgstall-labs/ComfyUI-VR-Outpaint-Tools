@@ -9,6 +9,10 @@ other ERP-aware diffusion / video models too.
    to know your footage's field of view.
 2. **Rectilinear → Equirect** — forward gnomonic projection for outpainting a
    normal perspective shot into a full 360° panorama.
+3. **Source Composite (360 outpaint finish)** — after generation, put the real
+   source pixels back over the model's reconstruction and correct the
+   outpaint's tone drift. The generated panorama keeps the original footage's
+   full quality where the source is known.
 
 ## Install
 
@@ -132,6 +136,38 @@ FOV so the footprint is spread wider than reality.
 crops were trained at **70–130°**, a true sub-70° source is out of distribution
 anyway — scaling it up to ~70° is both more detail-preserving *and* more in-domain.
 Tune per clip; the estimator always reports the true measured FOV.
+
+### Source Composite (360 outpaint finish)
+
+Finishing pass for the outpaint. The diffusion model only *reconstructs* the
+source region (VAE round-trip + generation), which softens its edges — and
+generated content drifts darker/off-tone the farther it gets from the guide.
+This node fixes both in pixel space, after the final decode:
+
+1. **Tone match** — fits one per-channel gain + offset where generation and
+   truth overlap (the source region) and applies it to the whole frame.
+   Corrects any global reconstruction tone shift. Fitted batch-wide, so it is
+   temporally stable.
+2. **Tone equalize** — corrects the *distance-dependent* drift: reads each
+   latitude band's low-frequency tone at the patch longitude (where tone is
+   trusted), extends that reference around the full 360°, and gain-corrects
+   each column toward it (clamped ×0.5–2.0). Preserves vertical lighting
+   structure (bright sky / dark ground) and color; one correction field for
+   the whole clip, so no flicker.
+3. **Composite** — pastes the pristine source pixels over the reconstruction
+   with a feathered, wrap-aware mask that ramps inward from the boundary
+   (never samples fill/black). Original sharpness and fidelity wherever the
+   source is known.
+
+| Input | Description |
+|---|---|
+| `generated` | The outpainted equirect video (final VAE decode) |
+| `source_equirect` / `outpaint_mask` | The same two outputs of **Rectilinear → Equirect** that fed the sampler |
+| `tone_match` | Strength of the global tone correction (default `1.0`) |
+| `feather_px` | Composite boundary feather, pixels (default `12`) |
+| `tone_equalize` | Strength of the longitudinal drift correction (default `0.7`). Lower it for scenes with strong legitimate directional lighting (sun on one side); raise to `1.0` for maximum flattening |
+
+Outputs the composited `IMAGE` batch.
 
 ## Notes
 

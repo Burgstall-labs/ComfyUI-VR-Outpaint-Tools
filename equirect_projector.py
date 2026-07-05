@@ -320,6 +320,164 @@ class RectilinearToEquirect:
         return (out, outpaint_mask)
 
 
+class EquirectSourceComposite:
+    """Finishing pass for 360 outpainting: put the real source pixels back.
+
+    The diffusion model only *reconstructs* the source region (VAE round-trip +
+    generation), which softens its edges; and generated content drifts in tone
+    the farther it gets from the guide. This node:
+
+      1. Tone-matches the generated frames to the true source. A single
+         per-channel linear correction (gain + offset) is fit where both are
+         known — the source-content region — and applied to the whole frame.
+         Fitted batch-wide, so the correction is temporally stable.
+      2. Composites the pristine source pixels over the generation with a
+         feathered, wrap-aware mask — original sharpness and fidelity where the
+         source is known, no hard step at the patch boundary.
+
+    Wire `source_equirect` and `outpaint_mask` straight from
+    Rectilinear → Equirect (the same outputs that fed the sampler), and
+    `generated` from the final VAE decode.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "generated": ("IMAGE",),
+                "source_equirect": ("IMAGE",),
+                "outpaint_mask": ("MASK",),
+                "tone_match": ("FLOAT", {
+                    "default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Strength of the global tone correction fitted on the "
+                    "source region (0 = composite only).",
+                }),
+                "feather_px": ("INT", {
+                    "default": 12, "min": 0, "max": 256, "step": 1,
+                    "tooltip": "Feather width of the composite boundary, in pixels. "
+                    "Wrap-aware along the width axis.",
+                }),
+                "tone_equalize": ("FLOAT", {
+                    "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Longitudinal tone equalization: corrects the low-frequency "
+                    "tone of each latitude band toward its value at the source patch, "
+                    "removing the distance-dependent tone drift of outpainted content. "
+                    "Preserves vertical lighting structure. Lower it if the scene has "
+                    "strong legitimate directional lighting (sun on one side).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("composited",)
+    FUNCTION = "composite"
+    CATEGORY = "360/projection"
+
+    @staticmethod
+    def _match_batch(t: torch.Tensor, B: int) -> torch.Tensor:
+        """Broadcast or trim/repeat a (b, ...) tensor to batch size B."""
+        b = t.shape[0]
+        if b == B:
+            return t
+        if b == 1:
+            return t.expand(B, *t.shape[1:])
+        if b > B:
+            return t[:B]
+        reps = [B // b + 1] + [1] * (t.ndim - 1)
+        return t.repeat(*reps)[:B]
+
+    @staticmethod
+    def _lowpass_equirect(img_chw: torch.Tensor, kw: int, kh: int, passes: int = 3) -> torch.Tensor:
+        """Wide separable box blur, circular along W, replicate along H.
+        img_chw: (C, H, W). Repeated passes approximate a gaussian."""
+        x = img_chw.unsqueeze(0)
+        for _ in range(passes):
+            x = F.pad(x, [kw // 2, kw // 2, 0, 0], mode="circular")
+            x = F.pad(x, [0, 0, kh // 2, kh // 2], mode="replicate")
+            x = F.avg_pool2d(x, kernel_size=(kh, kw), stride=1)
+        return x.squeeze(0)
+
+    def composite(self, generated, source_equirect, outpaint_mask, tone_match,
+                  feather_px, tone_equalize=0.0):
+        device = generated.device
+        # clone: the tone pass writes channels in place, and ComfyUI caches inputs
+        gen = generated.float().clone()
+        B, H, W, C = gen.shape
+        src = self._match_batch(source_equirect.float().to(device), B)
+        if src.shape[1:3] != (H, W):
+            src = F.interpolate(src.permute(0, 3, 1, 2), size=(H, W),
+                                mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
+        mask = self._match_batch(outpaint_mask.float().to(device), B)
+        if mask.shape[1:3] != (H, W):
+            mask = F.interpolate(mask.unsqueeze(1), size=(H, W),
+                                 mode="bilinear", align_corners=False).squeeze(1)
+        content = (1.0 - mask).clamp(0.0, 1.0)  # (B, H, W): 1 = source known
+
+        # ---- 1. Global tone correction, fit on the source region ----
+        if tone_match > 0.0:
+            w = content.reshape(-1)
+            wsum = w.sum().clamp(min=1e-6)
+            for ch in range(C):
+                g = gen[..., ch].reshape(-1)
+                s = src[..., ch].reshape(-1)
+                mg = (w * g).sum() / wsum
+                ms = (w * s).sum() / wsum
+                var_g = (w * (g - mg) ** 2).sum() / wsum
+                cov = (w * (g - mg) * (s - ms)).sum() / wsum
+                if var_g < 1e-8:
+                    continue
+                # Clamp the gain: the fit corrects tone drift, it must not
+                # invert or wildly rescale content on degenerate statistics.
+                a = (cov / var_g).clamp(0.5, 2.0)
+                b = ms - a * mg
+                corrected = gen[..., ch] * a + b
+                gen[..., ch] = gen[..., ch] * (1.0 - tone_match) + corrected * tone_match
+            gen = gen.clamp(0.0, 1.0)
+
+        # ---- 1b. Longitudinal tone equalization ----
+        # Outpainted tone drifts with distance from the source patch. Correct
+        # each latitude band's low frequencies toward that band's tone at the
+        # patch longitude. One correction field for the whole batch (no flicker).
+        if tone_equalize > 0.0:
+            kw = max(3, (W // 8) | 1)
+            kh = max(3, (H // 6) | 1)
+            mean_frame = gen.mean(dim=0).permute(2, 0, 1)  # (C, H, W)
+            lf = self._lowpass_equirect(mean_frame, kw, kh)  # (C, H, W)
+            # Reference tone per (row, channel): content-weighted mean over columns,
+            # i.e. the tone at the patch longitude.
+            cmask = content.mean(dim=0)  # (H, W)
+            row_w = cmask.sum(dim=-1)  # (H,)
+            ref = (lf * cmask.unsqueeze(0)).sum(dim=-1) / row_w.clamp(min=1e-6)  # (C, H)
+            # Rows the patch doesn't reach: extend from the nearest covered row.
+            covered = row_w > (0.02 * W)
+            if covered.any() and not covered.all():
+                cov_idx = torch.where(covered)[0]
+                nearest = cov_idx[torch.argmin(
+                    (torch.arange(H, device=device).unsqueeze(1) - cov_idx.unsqueeze(0)).abs(), dim=1)]
+                ref = ref[:, nearest]
+            if covered.any():
+                gain = (ref.unsqueeze(-1) / lf.clamp(min=1e-3)).clamp(0.5, 2.0)  # (C, H, W)
+                gain = 1.0 + (gain - 1.0) * float(tone_equalize)
+                gen = (gen * gain.permute(1, 2, 0).unsqueeze(0)).clamp(0.0, 1.0)
+
+        # ---- 2. Feathered, wrap-aware composite ----
+        m = content.unsqueeze(1)  # (B, 1, H, W)
+        if feather_px > 0:
+            k = int(feather_px) * 2 + 1
+            # Erode first (min-pool) so the feather ramps *inward* from the true
+            # boundary — blurred mask stays 0 everywhere the source is unknown,
+            # never sampling fill/black into the composite.
+            m = -F.max_pool2d(-F.pad(m, [feather_px] * 4, mode="constant", value=1.0),
+                              kernel_size=k, stride=1)
+            m = F.pad(m, [feather_px, feather_px, 0, 0], mode="circular")
+            m = F.pad(m, [0, 0, feather_px, feather_px], mode="replicate")
+            m = F.avg_pool2d(m, kernel_size=k, stride=1)
+        m = m.squeeze(1).unsqueeze(-1).clamp(0.0, 1.0)  # (B, H, W, 1)
+
+        out = src * m + gen * (1.0 - m)
+        return (out.clamp(0.0, 1.0).to(generated.dtype),)
+
+
 # ---------------------------------------------------------------------------
 # Camera calibration (GeoCalib) — auto-estimate FOV / orientation from a frame
 # ---------------------------------------------------------------------------
@@ -422,9 +580,11 @@ class EstimateCameraGeoCalib:
 NODE_CLASS_MAPPINGS = {
     "EstimateCameraGeoCalib": EstimateCameraGeoCalib,
     "RectilinearToEquirect": RectilinearToEquirect,
+    "EquirectSourceComposite": EquirectSourceComposite,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EstimateCameraGeoCalib": "Estimate Camera (GeoCalib)",
     "RectilinearToEquirect": "Rectilinear → Equirect (360 outpaint prep)",
+    "EquirectSourceComposite": "Source Composite (360 outpaint finish)",
 }
