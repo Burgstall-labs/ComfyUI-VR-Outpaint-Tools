@@ -179,4 +179,8 @@ Outputs the composited `IMAGE` batch.
 
 ## License
 
-MIT.
+This nodepack is licensed under the **PolyForm Noncommercial License 1.0.0**
+(https://polyformproject.org/licenses/noncommercial/1.0.0). Noncommercial use
+(research, academic, personal, hobbyist) is free. Commercial use requires a
+separate license — contact **howdy@theaiwrangler.com**. See the LICENSE file
+for details.
