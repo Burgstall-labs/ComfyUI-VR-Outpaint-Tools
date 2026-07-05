@@ -1,3 +1,4 @@
+import logging
 import math
 import numpy as np
 import torch
@@ -8,6 +9,13 @@ try:
     _HAS_SCIPY = True
 except ImportError:
     _HAS_SCIPY = False
+
+try:
+    import comfy.utils as _comfy_utils
+except ImportError:  # standalone test runs outside ComfyUI
+    _comfy_utils = None
+
+logger = logging.getLogger("VROutpaintTools")
 
 
 def _max_rect_in_histogram(hist):
@@ -195,6 +203,11 @@ class RectilinearToEquirect:
                 # regardless of letterbox stripping. When 0, focal is derived from
                 # hfov_deg and the (de-letterboxed) input width.
                 "focal_px": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100000.0, "step": 1.0}),
+                # Angular span of the output canvas. 360/180 = full equirect.
+                # 180/180 on a square canvas = hemisphere ("square equirect"),
+                # e.g. for fulldome: nothing is generated outside the dome.
+                "canvas_hfov_deg": ("FLOAT", {"default": 360.0, "min": 90.0, "max": 360.0, "step": 1.0}),
+                "canvas_vfov_deg": ("FLOAT", {"default": 180.0, "min": 90.0, "max": 180.0, "step": 1.0}),
             },
         }
 
@@ -205,7 +218,8 @@ class RectilinearToEquirect:
 
     def project(self, image, hfov_deg, fov_scale, equirect_width, equirect_height,
                 yaw_deg, pitch_deg, roll_deg, shape, fill_value, feather_px,
-                strip_letterbox=True, letterbox_threshold=0.06, focal_px=0.0):
+                strip_letterbox=True, letterbox_threshold=0.06, focal_px=0.0,
+                canvas_hfov_deg=360.0, canvas_vfov_deg=180.0):
         device = image.device
         dtype = image.dtype
         if strip_letterbox and image.shape[0] > 0:
@@ -215,9 +229,13 @@ class RectilinearToEquirect:
         B, Hi, Wi, _ = image.shape
         Weq, Heq = int(equirect_width), int(equirect_height)
 
-        # Equirect lat/lon grid (shape: Heq × Weq)
-        lon = (torch.linspace(0, Weq - 1, Weq, device=device, dtype=torch.float32) / Weq - 0.5) * 2 * math.pi
-        lat = (0.5 - torch.linspace(0, Heq - 1, Heq, device=device, dtype=torch.float32) / Heq) * math.pi
+        # Equirect lat/lon grid (shape: Heq × Weq). Canvas spans default to a
+        # full 360x180 panorama; smaller spans keep the same deg-per-pixel
+        # convention over a partial canvas (e.g. 180x180 square hemisphere).
+        h_span = math.radians(canvas_hfov_deg)
+        v_span = math.radians(canvas_vfov_deg)
+        lon = (torch.linspace(0, Weq - 1, Weq, device=device, dtype=torch.float32) / Weq - 0.5) * h_span
+        lat = (0.5 - torch.linspace(0, Heq - 1, Heq, device=device, dtype=torch.float32) / Heq) * v_span
         lon_grid, lat_grid = torch.meshgrid(lon, lat, indexing='xy')
 
         lon0 = math.radians(yaw_deg)
@@ -366,6 +384,14 @@ class EquirectSourceComposite:
                     "strong legitimate directional lighting (sun on one side).",
                 }),
             },
+            "optional": {
+                "wrap_w": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Treat the canvas as wrapping horizontally (full 360 "
+                    "equirect). Disable for partial canvases like the 180x180 "
+                    "square hemisphere.",
+                }),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -387,65 +413,86 @@ class EquirectSourceComposite:
         return t.repeat(*reps)[:B]
 
     @staticmethod
-    def _lowpass_equirect(img_chw: torch.Tensor, kw: int, kh: int, passes: int = 3) -> torch.Tensor:
-        """Wide separable box blur, circular along W, replicate along H.
-        img_chw: (C, H, W). Repeated passes approximate a gaussian."""
+    def _lowpass_equirect(img_chw: torch.Tensor, wrap_w: bool = True) -> torch.Tensor:
+        """Low-frequency field of an equirect image.
+
+        Downsamples to a small fixed grid, applies separable box blurs there
+        (wrap-aware along W), and upsamples back — O(H*W) regardless of blur
+        radius, unlike blurring at full resolution.  img_chw: (C, H, W).
+        """
+        C, H, W = img_chw.shape
         x = img_chw.unsqueeze(0)
-        for _ in range(passes):
-            x = F.pad(x, [kw // 2, kw // 2, 0, 0], mode="circular")
-            x = F.pad(x, [0, 0, kh // 2, kh // 2], mode="replicate")
-            x = F.avg_pool2d(x, kernel_size=(kh, kw), stride=1)
-        return x.squeeze(0)
+        SW, SH = min(128, W), min(64, H)
+        small = F.interpolate(x, size=(SH, SW), mode="area")
+        kw = max(3, (SW // 8) | 1)
+        kh = max(3, (SH // 6) | 1)
+        w_mode = "circular" if wrap_w else "replicate"
+        for _ in range(3):
+            small = F.pad(small, [kw // 2, kw // 2, 0, 0], mode=w_mode)
+            small = F.avg_pool2d(small, kernel_size=(1, kw), stride=1)
+            small = F.pad(small, [0, 0, kh // 2, kh // 2], mode="replicate")
+            small = F.avg_pool2d(small, kernel_size=(kh, 1), stride=1)
+        return F.interpolate(small, size=(H, W), mode="bilinear",
+                             align_corners=False).squeeze(0)
 
     def composite(self, generated, source_equirect, outpaint_mask, tone_match,
-                  feather_px, tone_equalize=0.0):
+                  feather_px, tone_equalize=0.0, wrap_w=True):
         device = generated.device
-        # clone: the tone pass writes channels in place, and ComfyUI caches inputs
-        gen = generated.float().clone()
+        gen = generated.float()  # all passes below are out-of-place
         B, H, W, C = gen.shape
+        logger.info("SourceComposite: %d frames %dx%d (tone_match=%.2f, "
+                    "tone_equalize=%.2f, feather=%d, wrap_w=%s)",
+                    B, W, H, tone_match, tone_equalize, feather_px, wrap_w)
+        pbar = _comfy_utils.ProgressBar(4) if _comfy_utils is not None else None
         src = self._match_batch(source_equirect.float().to(device), B)
         if src.shape[1:3] != (H, W):
             src = F.interpolate(src.permute(0, 3, 1, 2), size=(H, W),
                                 mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
-        mask = self._match_batch(outpaint_mask.float().to(device), B)
-        if mask.shape[1:3] != (H, W):
-            mask = F.interpolate(mask.unsqueeze(1), size=(H, W),
-                                 mode="bilinear", align_corners=False).squeeze(1)
-        content = (1.0 - mask).clamp(0.0, 1.0)  # (B, H, W): 1 = source known
+        # Keep the un-expanded mask: morphology/blur run once on the unique
+        # mask, not on B expanded copies of it.
+        mask_u = outpaint_mask.float().to(device)
+        if mask_u.shape[1:3] != (H, W):
+            mask_u = F.interpolate(mask_u.unsqueeze(1), size=(H, W),
+                                   mode="bilinear", align_corners=False).squeeze(1)
+        content_u = (1.0 - mask_u).clamp(0.0, 1.0)  # (b, H, W): 1 = source known
+        content = self._match_batch(content_u, B)   # (B, H, W)
+        if pbar:
+            pbar.update(1)
 
         # ---- 1. Global tone correction, fit on the source region ----
         if tone_match > 0.0:
-            w = content.reshape(-1)
+            w = content.reshape(-1, 1)                      # (N, 1)
+            gf = gen.reshape(-1, C)                         # (N, C), contiguous views
+            sf = src.reshape(-1, C)
             wsum = w.sum().clamp(min=1e-6)
-            for ch in range(C):
-                g = gen[..., ch].reshape(-1)
-                s = src[..., ch].reshape(-1)
-                mg = (w * g).sum() / wsum
-                ms = (w * s).sum() / wsum
-                var_g = (w * (g - mg) ** 2).sum() / wsum
-                cov = (w * (g - mg) * (s - ms)).sum() / wsum
-                if var_g < 1e-8:
-                    continue
-                # Clamp the gain: the fit corrects tone drift, it must not
-                # invert or wildly rescale content on degenerate statistics.
-                a = (cov / var_g).clamp(0.5, 2.0)
-                b = ms - a * mg
-                corrected = gen[..., ch] * a + b
-                gen[..., ch] = gen[..., ch] * (1.0 - tone_match) + corrected * tone_match
-            gen = gen.clamp(0.0, 1.0)
+            # Weighted moments, all channels at once (moment form avoids
+            # allocating centered copies of the full tensors).
+            mg = (w * gf).sum(dim=0) / wsum                 # (C,)
+            ms = (w * sf).sum(dim=0) / wsum
+            var_g = (w * gf * gf).sum(dim=0) / wsum - mg * mg
+            cov = (w * gf * sf).sum(dim=0) / wsum - mg * ms
+            # Clamp the gain: the fit corrects tone drift, it must not
+            # invert or wildly rescale content on degenerate statistics.
+            a = (cov / var_g.clamp(min=1e-8)).clamp(0.5, 2.0)
+            b = ms - a * mg
+            valid = var_g > 1e-8
+            a = torch.where(valid, a, torch.ones_like(a))
+            b = torch.where(valid, b, torch.zeros_like(b))
+            corrected = gen * a + b
+            gen = (gen * (1.0 - tone_match) + corrected * tone_match).clamp(0.0, 1.0)
+        if pbar:
+            pbar.update(1)
 
         # ---- 1b. Longitudinal tone equalization ----
         # Outpainted tone drifts with distance from the source patch. Correct
         # each latitude band's low frequencies toward that band's tone at the
         # patch longitude. One correction field for the whole batch (no flicker).
         if tone_equalize > 0.0:
-            kw = max(3, (W // 8) | 1)
-            kh = max(3, (H // 6) | 1)
             mean_frame = gen.mean(dim=0).permute(2, 0, 1)  # (C, H, W)
-            lf = self._lowpass_equirect(mean_frame, kw, kh)  # (C, H, W)
+            lf = self._lowpass_equirect(mean_frame, wrap_w=wrap_w)  # (C, H, W)
             # Reference tone per (row, channel): content-weighted mean over columns,
             # i.e. the tone at the patch longitude.
-            cmask = content.mean(dim=0)  # (H, W)
+            cmask = content_u.mean(dim=0)  # (H, W)
             row_w = cmask.sum(dim=-1)  # (H,)
             ref = (lf * cmask.unsqueeze(0)).sum(dim=-1) / row_w.clamp(min=1e-6)  # (C, H)
             # Rows the patch doesn't reach: extend from the nearest covered row.
@@ -460,21 +507,32 @@ class EquirectSourceComposite:
                 gain = 1.0 + (gain - 1.0) * float(tone_equalize)
                 gen = (gen * gain.permute(1, 2, 0).unsqueeze(0)).clamp(0.0, 1.0)
 
+        if pbar:
+            pbar.update(1)
+
         # ---- 2. Feathered, wrap-aware composite ----
-        m = content.unsqueeze(1)  # (B, 1, H, W)
+        # Computed on the unique mask (usually batch 1), then broadcast to B.
+        m = content_u.unsqueeze(1)  # (b, 1, H, W)
         if feather_px > 0:
-            k = int(feather_px) * 2 + 1
-            # Erode first (min-pool) so the feather ramps *inward* from the true
-            # boundary — blurred mask stays 0 everywhere the source is unknown,
-            # never sampling fill/black into the composite.
-            m = -F.max_pool2d(-F.pad(m, [feather_px] * 4, mode="constant", value=1.0),
-                              kernel_size=k, stride=1)
-            m = F.pad(m, [feather_px, feather_px, 0, 0], mode="circular")
-            m = F.pad(m, [0, 0, feather_px, feather_px], mode="replicate")
-            m = F.avg_pool2d(m, kernel_size=k, stride=1)
-        m = m.squeeze(1).unsqueeze(-1).clamp(0.0, 1.0)  # (B, H, W, 1)
+            fp = int(feather_px)
+            k = fp * 2 + 1
+            # Erode first (separable min-pool) so the feather ramps *inward*
+            # from the true boundary — blurred mask stays 0 everywhere the
+            # source is unknown, never sampling fill/black into the composite.
+            m = -F.max_pool2d(-F.pad(m, [fp, fp, 0, 0], mode="constant", value=1.0),
+                              kernel_size=(1, k), stride=1)
+            m = -F.max_pool2d(-F.pad(m, [0, 0, fp, fp], mode="constant", value=1.0),
+                              kernel_size=(k, 1), stride=1)
+            # Separable box blur
+            m = F.pad(m, [fp, fp, 0, 0], mode="circular" if wrap_w else "replicate")
+            m = F.avg_pool2d(m, kernel_size=(1, k), stride=1)
+            m = F.pad(m, [0, 0, fp, fp], mode="replicate")
+            m = F.avg_pool2d(m, kernel_size=(k, 1), stride=1)
+        m = self._match_batch(m.squeeze(1), B).unsqueeze(-1).clamp(0.0, 1.0)  # (B, H, W, 1)
 
         out = src * m + gen * (1.0 - m)
+        if pbar:
+            pbar.update(1)
         return (out.clamp(0.0, 1.0).to(generated.dtype),)
 
 

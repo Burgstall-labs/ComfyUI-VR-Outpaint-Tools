@@ -14,6 +14,11 @@ other ERP-aware diffusion / video models too.
    outpaint's tone drift. The generated panorama keeps the original footage's
    full quality where the source is known.
 
+For fulldome / planetarium delivery of the outpainted panorama, see the
+companion pack
+[**ComfyUI-Domemaster-Outpaint**](https://github.com/Burgstall-labs/ComfyUI-Domemaster-Outpaint)
+(domemaster rendering with tilted-venue presets, square-hemisphere workflow).
+
 ## Install
 
 ```bash
@@ -110,6 +115,7 @@ outpaint mask marking the region the model should generate.
 | `feather_px` | Soft-edge the content/mask boundary |
 | `strip_letterbox` / `letterbox_threshold` | Auto-crop black bars before projection |
 | `focal_px` *(optional)* | Focal length in pixels; when `> 0` it overrides `hfov_deg`. Wire from **Estimate Camera (GeoCalib)** — crop-invariant, so it stays correct through letterbox stripping |
+| `canvas_hfov_deg` / `canvas_vfov_deg` *(optional)* | Angular span of the output canvas (default `360` / `180` = full equirect). `180` / `180` on a square canvas = **square hemisphere** (covers exactly one dome — see ComfyUI-Domemaster-Outpaint) |
 
 Outputs `(equirect_image, outpaint_mask)`.
 
@@ -166,6 +172,7 @@ This node fixes both in pixel space, after the final decode:
 | `tone_match` | Strength of the global tone correction (default `1.0`) |
 | `feather_px` | Composite boundary feather, pixels (default `12`) |
 | `tone_equalize` | Strength of the longitudinal drift correction (default `0.7`). Lower it for scenes with strong legitimate directional lighting (sun on one side); raise to `1.0` for maximum flattening |
+| `wrap_w` *(optional)* | Treat the canvas as wrapping horizontally (default on). Disable for partial canvases like the square hemisphere |
 
 Outputs the composited `IMAGE` batch.
 
