@@ -26,7 +26,7 @@ text-to-video side of the project, are in the
 
 | | | |
 |---|---|---|
-| [![Jungle clearing, outpainted](docs/media/outpaint-jungle-clearing.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-jungle-clearing.mp4) | [![Covered market hall, outpainted](docs/media/outpaint-market-hall.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-market-hall.mp4) | [![Skatepark run, outpainted](docs/media/outpaint-skatepark.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-skatepark.mp4) |
+| [![Jungle clearing, outpainted](docs/media/outpaint-jungle-clearing.gif)](https://theburgstall-360viewer.static.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-jungle-clearing.mp4) | [![Covered market hall, outpainted](docs/media/outpaint-market-hall.gif)](https://theburgstall-360viewer.static.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-market-hall.mp4) | [![Skatepark run, outpainted](docs/media/outpaint-skatepark.gif)](https://theburgstall-360viewer.static.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-skatepark.mp4) |
 | Jungle clearing | Covered market hall | Skatepark run |
 
 The example workflow used for these:
