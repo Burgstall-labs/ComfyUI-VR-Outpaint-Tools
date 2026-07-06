@@ -14,10 +14,30 @@ other ERP-aware diffusion / video models too.
    outpaint's tone drift. The generated panorama keeps the original footage's
    full quality where the source is known.
 
-For fulldome / planetarium delivery of the outpainted panorama, see the
-companion pack
-[**ComfyUI-Domemaster-Outpaint**](https://github.com/Burgstall-labs/ComfyUI-Domemaster-Outpaint)
-(domemaster rendering with tilted-venue presets, square-hemisphere workflow).
+**Try it / see it live:** [360° gallery + interactive viewer](https://huggingface.co/spaces/TheBurgstall/360viewer) — sample outpaints below, drag to look around.
+
+## Examples
+
+Three flat videos outpainted into full 360° panoramas with the pipeline
+above (projection → IC-LoRA outpaint → Source Composite finishing). Click a
+clip to open it in the interactive viewer. More clips, including the
+text-to-video side of the project, are in the
+[full gallery](https://huggingface.co/spaces/TheBurgstall/360viewer/blob/main/gallery.html).
+
+| | | |
+|---|---|---|
+| [![Jungle clearing, outpainted](docs/media/outpaint-jungle-clearing.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-jungle-clearing.mp4) | [![Covered market hall, outpainted](docs/media/outpaint-market-hall.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-market-hall.mp4) | [![Skatepark run, outpainted](docs/media/outpaint-skatepark.gif)](https://theburgstall-360viewer.hf.space/index.html?url=https%3A%2F%2Fhuggingface.co%2Fspaces%2FTheBurgstall%2F360viewer%2Fresolve%2Fmain%2Fmedia%2Foutpaint-skatepark.mp4) |
+| Jungle clearing | Covered market hall | Skatepark run |
+
+The example workflow used for these:
+[`example_workflows/Burgstall-SEAMLESS-VR-Outpaint.json`](example_workflows/Burgstall-SEAMLESS-VR-Outpaint.json).
+
+## Related Burgstall Labs Work
+
+- **[360° gallery + viewer](https://huggingface.co/spaces/TheBurgstall/360viewer)** — sample generations from this pack and from Seamless-Equirectangular, viewable interactively; both example workflows are downloadable there too.
+- **[ComfyUI-Seamless-Equirectangular](https://github.com/Burgstall-labs/ComfyUI-Seamless-Equirectangular)** — seamless text-to-video 360° generation (no source footage) with the same equirectangular LoRA, seam, and pole techniques.
+- **[ComfyUI-Domemaster-Outpaint](https://github.com/Burgstall-labs/ComfyUI-Domemaster-Outpaint)** — companion pack for fulldome / planetarium delivery of the outpainted panorama (domemaster rendering with tilted-venue presets, square-hemisphere workflow).
+- **[Seamless-Equirectangular-LTX2.3-LoRA](https://huggingface.co/TheBurgstall/Seamless-Equirectangular-LTX2.3-LoRA)** — the LoRA the outpaint IC-LoRA pipeline is built around.
 
 ## Install
 
