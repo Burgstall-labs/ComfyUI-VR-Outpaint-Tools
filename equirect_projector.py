@@ -399,18 +399,80 @@ class EquirectSourceComposite:
     FUNCTION = "composite"
     CATEGORY = "360/projection"
 
+    # Bound temporary working sets by pixels rather than frames. At UHD
+    # equirect resolution this deliberately selects one frame at a time; at
+    # smaller resolutions a few frames are grouped to avoid excessive kernel
+    # launch overhead. The input and output IMAGE batches still have to fit in
+    # memory, but intermediate tensors no longer scale with the full clip.
+    _MAX_CHUNK_PIXELS = 8 * 1024 * 1024
+
     @staticmethod
-    def _match_batch(t: torch.Tensor, B: int) -> torch.Tensor:
-        """Broadcast or trim/repeat a (b, ...) tensor to batch size B."""
+    def _batch_slice(t: torch.Tensor, start: int, end: int, B: int) -> torch.Tensor:
+        """Return the matched-batch slice [start:end] without expanding all B items."""
         b = t.shape[0]
-        if b == B:
-            return t
+        if b == 0:
+            raise ValueError("SourceComposite: empty source or mask batch")
+        if b >= B:
+            return t[start:end]
         if b == 1:
-            return t.expand(B, *t.shape[1:])
-        if b > B:
-            return t[:B]
-        reps = [B // b + 1] + [1] * (t.ndim - 1)
-        return t.repeat(*reps)[:B]
+            return t.expand(end - start, *t.shape[1:])
+        indices = torch.arange(start, end, device=t.device) % b
+        return t.index_select(0, indices)
+
+    @classmethod
+    def _image_chunk(cls, image: torch.Tensor, start: int, end: int, B: int,
+                     H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Fetch, move, convert, and if needed resize only one image chunk."""
+        chunk = cls._batch_slice(image, start, end, B).to(
+            device=device, dtype=torch.float32)
+        if chunk.shape[1:3] != (H, W):
+            chunk = F.interpolate(
+                chunk.permute(0, 3, 1, 2), size=(H, W),
+                mode="bilinear", align_corners=False,
+            ).permute(0, 2, 3, 1)
+        return chunk
+
+    @classmethod
+    def _content_chunk(cls, outpaint_mask: torch.Tensor, start: int, end: int,
+                       B: int, H: int, W: int,
+                       device: torch.device) -> torch.Tensor:
+        """Fetch and resize one mask chunk, returned as source-content weights."""
+        mask = cls._batch_slice(outpaint_mask, start, end, B).to(
+            device=device, dtype=torch.float32)
+        if mask.shape[1:3] != (H, W):
+            mask = F.interpolate(
+                mask.unsqueeze(1), size=(H, W),
+                mode="bilinear", align_corners=False,
+            ).squeeze(1)
+        return (1.0 - mask).clamp_(0.0, 1.0)
+
+    @staticmethod
+    def _feather_content(content: torch.Tensor, feather_px: int,
+                         wrap_w: bool) -> torch.Tensor:
+        """Feather a (b,H,W) content mask and return broadcastable BHWC weights."""
+        m = content.unsqueeze(1)
+        if feather_px > 0:
+            fp = int(feather_px)
+            k = fp * 2 + 1
+            # Erode first (separable min-pool) so the feather ramps *inward*
+            # from the true boundary. The blurred mask therefore remains zero
+            # wherever source pixels are unknown.
+            m = -F.max_pool2d(
+                -F.pad(m, [fp, fp, 0, 0], mode="constant", value=1.0),
+                kernel_size=(1, k), stride=1,
+            )
+            m = -F.max_pool2d(
+                -F.pad(m, [0, 0, fp, fp], mode="constant", value=1.0),
+                kernel_size=(k, 1), stride=1,
+            )
+            m = F.pad(
+                m, [fp, fp, 0, 0],
+                mode="circular" if wrap_w else "replicate",
+            )
+            m = F.avg_pool2d(m, kernel_size=(1, k), stride=1)
+            m = F.pad(m, [0, 0, fp, fp], mode="replicate")
+            m = F.avg_pool2d(m, kernel_size=(k, 1), stride=1)
+        return m.squeeze(1).unsqueeze(-1).clamp_(0.0, 1.0)
 
     @staticmethod
     def _lowpass_equirect(img_chw: torch.Tensor, wrap_w: bool = True) -> torch.Tensor:
@@ -438,39 +500,71 @@ class EquirectSourceComposite:
     def composite(self, generated, source_equirect, outpaint_mask, tone_match,
                   feather_px, tone_equalize=0.0, wrap_w=True):
         device = generated.device
-        gen = generated.float()  # all passes below are out-of-place
-        B, H, W, C = gen.shape
+        B, H, W, C = generated.shape
+        if B == 0:
+            raise ValueError("SourceComposite: empty generated batch")
+        chunk_frames = max(1, min(
+            B, self._MAX_CHUNK_PIXELS // max(H * W, 1),
+        ))
         logger.info("SourceComposite: %d frames %dx%d (tone_match=%.2f, "
-                    "tone_equalize=%.2f, feather=%d, wrap_w=%s)",
-                    B, W, H, tone_match, tone_equalize, feather_px, wrap_w)
+                    "tone_equalize=%.2f, feather=%d, wrap_w=%s, chunk=%d)",
+                    B, W, H, tone_match, tone_equalize, feather_px, wrap_w,
+                    chunk_frames)
         pbar = _comfy_utils.ProgressBar(4) if _comfy_utils is not None else None
-        src = self._match_batch(source_equirect.float().to(device), B)
-        if src.shape[1:3] != (H, W):
-            src = F.interpolate(src.permute(0, 3, 1, 2), size=(H, W),
-                                mode="bilinear", align_corners=False).permute(0, 2, 3, 1)
-        # Keep the un-expanded mask: morphology/blur run once on the unique
-        # mask, not on B expanded copies of it.
-        mask_u = outpaint_mask.float().to(device)
-        if mask_u.shape[1:3] != (H, W):
-            mask_u = F.interpolate(mask_u.unsqueeze(1), size=(H, W),
-                                   mode="bilinear", align_corners=False).squeeze(1)
-        content_u = (1.0 - mask_u).clamp(0.0, 1.0)  # (b, H, W): 1 = source known
-        content = self._match_batch(content_u, B)   # (B, H, W)
-        if pbar:
-            pbar.update(1)
 
         # ---- 1. Global tone correction, fit on the source region ----
+        # Accumulate only channel-sized statistics. The previous vectorized
+        # implementation formed several (B,H,W,C) products simultaneously.
+        alpha = beta = None
+        cmask_sum = (torch.zeros((H, W), device=device, dtype=torch.float32)
+                     if tone_equalize > 0.0 else None)
         if tone_match > 0.0:
-            w = content.reshape(-1, 1)                      # (N, 1)
-            gf = gen.reshape(-1, C)                         # (N, C), contiguous views
-            sf = src.reshape(-1, C)
-            wsum = w.sum().clamp(min=1e-6)
-            # Weighted moments, all channels at once (moment form avoids
-            # allocating centered copies of the full tensors).
-            mg = (w * gf).sum(dim=0) / wsum                 # (C,)
-            ms = (w * sf).sum(dim=0) / wsum
-            var_g = (w * gf * gf).sum(dim=0) / wsum - mg * mg
-            cov = (w * gf * sf).sum(dim=0) / wsum - mg * ms
+            wsum = torch.zeros((), device=device, dtype=torch.float64)
+            sum_g = torch.zeros(C, device=device, dtype=torch.float64)
+            sum_s = torch.zeros(C, device=device, dtype=torch.float64)
+            sum_gg = torch.zeros(C, device=device, dtype=torch.float64)
+            sum_gs = torch.zeros(C, device=device, dtype=torch.float64)
+
+        # This pass also accumulates the clip-average content mask used by tone
+        # equalization, avoiding a materialized B-frame mask.
+        if tone_match > 0.0 or tone_equalize > 0.0:
+            for start in range(0, B, chunk_frames):
+                end = min(start + chunk_frames, B)
+                content = self._content_chunk(
+                    outpaint_mask, start, end, B, H, W, device)
+                if cmask_sum is not None:
+                    for frame_mask in content:
+                        cmask_sum.add_(frame_mask)
+                if tone_match > 0.0:
+                    gen_chunk = self._image_chunk(
+                        generated, start, end, B, H, W, device)
+                    src_chunk = self._image_chunk(
+                        source_equirect, start, end, B, H, W, device)
+                    # Einsum performs the reductions without explicitly
+                    # constructing full-size weighted/centered copies.
+                    wsum.add_(content.sum().to(torch.float64))
+                    sum_g.add_(torch.einsum(
+                        "bhw,bhwc->c", content, gen_chunk).to(torch.float64))
+                    sum_s.add_(torch.einsum(
+                        "bhw,bhwc->c", content, src_chunk).to(torch.float64))
+                    sum_gg.add_(torch.einsum(
+                        "bhw,bhwc,bhwc->c", content, gen_chunk,
+                        gen_chunk).to(torch.float64))
+                    sum_gs.add_(torch.einsum(
+                        "bhw,bhwc,bhwc->c", content, gen_chunk,
+                        src_chunk).to(torch.float64))
+            # Python loop variables retain their last value. Release the last
+            # bounded chunk before allocating the equalization fields/output.
+            del content
+            if tone_match > 0.0:
+                del gen_chunk, src_chunk
+
+        if tone_match > 0.0:
+            safe_wsum = wsum.clamp(min=1e-6)
+            mg = sum_g / safe_wsum
+            ms = sum_s / safe_wsum
+            var_g = sum_gg / safe_wsum - mg * mg
+            cov = sum_gs / safe_wsum - mg * ms
             # Clamp the gain: the fit corrects tone drift, it must not
             # invert or wildly rescale content on degenerate statistics.
             a = (cov / var_g.clamp(min=1e-8)).clamp(0.5, 2.0)
@@ -478,8 +572,22 @@ class EquirectSourceComposite:
             valid = var_g > 1e-8
             a = torch.where(valid, a, torch.ones_like(a))
             b = torch.where(valid, b, torch.zeros_like(b))
-            corrected = gen * a + b
-            gen = (gen * (1.0 - tone_match) + corrected * tone_match).clamp(0.0, 1.0)
+            # Fold the strength blend into one affine transform. Keep these
+            # coefficients float32 so applying them does not promote frames.
+            alpha = (1.0 + (a - 1.0) * float(tone_match)).to(torch.float32)
+            beta = (b * float(tone_match)).to(torch.float32)
+        if pbar:
+            pbar.update(1)
+
+        def corrected_chunk(start, end):
+            chunk = self._image_chunk(
+                generated, start, end, B, H, W, device)
+            if alpha is None:
+                return chunk
+            # Out-of-place multiply protects the generated input; subsequent
+            # operations may safely update this bounded working tensor in place.
+            return chunk.mul(alpha).add_(beta).clamp_(0.0, 1.0)
+
         if pbar:
             pbar.update(1)
 
@@ -487,12 +595,24 @@ class EquirectSourceComposite:
         # Outpainted tone drifts with distance from the source patch. Correct
         # each latitude band's low frequencies toward that band's tone at the
         # patch longitude. One correction field for the whole batch (no flicker).
+        gain = None
         if tone_equalize > 0.0:
-            mean_frame = gen.mean(dim=0).permute(2, 0, 1)  # (C, H, W)
+            mean_frame = torch.zeros(
+                (C, H, W), device=device, dtype=torch.float32)
+            for start in range(0, B, chunk_frames):
+                end = min(start + chunk_frames, B)
+                chunk = corrected_chunk(start, end)
+                # A frame-at-a-time in-place accumulation avoids the full-frame
+                # temporary produced by sum(dim=0).
+                for frame in chunk:
+                    mean_frame.add_(frame.permute(2, 0, 1))
+            del chunk, frame
+            mean_frame.div_(B)
             lf = self._lowpass_equirect(mean_frame, wrap_w=wrap_w)  # (C, H, W)
+            del mean_frame
             # Reference tone per (row, channel): content-weighted mean over columns,
             # i.e. the tone at the patch longitude.
-            cmask = content_u.mean(dim=0)  # (H, W)
+            cmask = cmask_sum.div_(B)  # (H, W)
             row_w = cmask.sum(dim=-1)  # (H,)
             ref = (lf * cmask.unsqueeze(0)).sum(dim=-1) / row_w.clamp(min=1e-6)  # (C, H)
             # Rows the patch doesn't reach: extend from the nearest covered row.
@@ -503,37 +623,44 @@ class EquirectSourceComposite:
                     (torch.arange(H, device=device).unsqueeze(1) - cov_idx.unsqueeze(0)).abs(), dim=1)]
                 ref = ref[:, nearest]
             if covered.any():
-                gain = (ref.unsqueeze(-1) / lf.clamp(min=1e-3)).clamp(0.5, 2.0)  # (C, H, W)
-                gain = 1.0 + (gain - 1.0) * float(tone_equalize)
-                gen = (gen * gain.permute(1, 2, 0).unsqueeze(0)).clamp(0.0, 1.0)
+                lf.clamp_(min=1e-3)
+                gain = ref.unsqueeze(-1).div(lf).clamp_(0.5, 2.0)  # (C, H, W)
+                gain.sub_(1.0).mul_(float(tone_equalize)).add_(1.0)
+            del lf, cmask, cmask_sum
 
         if pbar:
             pbar.update(1)
 
         # ---- 2. Feathered, wrap-aware composite ----
-        # Computed on the unique mask (usually batch 1), then broadcast to B.
-        m = content_u.unsqueeze(1)  # (b, 1, H, W)
-        if feather_px > 0:
-            fp = int(feather_px)
-            k = fp * 2 + 1
-            # Erode first (separable min-pool) so the feather ramps *inward*
-            # from the true boundary — blurred mask stays 0 everywhere the
-            # source is unknown, never sampling fill/black into the composite.
-            m = -F.max_pool2d(-F.pad(m, [fp, fp, 0, 0], mode="constant", value=1.0),
-                              kernel_size=(1, k), stride=1)
-            m = -F.max_pool2d(-F.pad(m, [0, 0, fp, fp], mode="constant", value=1.0),
-                              kernel_size=(k, 1), stride=1)
-            # Separable box blur
-            m = F.pad(m, [fp, fp, 0, 0], mode="circular" if wrap_w else "replicate")
-            m = F.avg_pool2d(m, kernel_size=(1, k), stride=1)
-            m = F.pad(m, [0, 0, fp, fp], mode="replicate")
-            m = F.avg_pool2d(m, kernel_size=(k, 1), stride=1)
-        m = self._match_batch(m.squeeze(1), B).unsqueeze(-1).clamp(0.0, 1.0)  # (B, H, W, 1)
+        out = torch.empty_like(generated)
+        gain_hwc = gain.permute(1, 2, 0).unsqueeze(0) if gain is not None else None
+        for start in range(0, B, chunk_frames):
+            end = min(start + chunk_frames, B)
+            gen_chunk = corrected_chunk(start, end)
+            if gain_hwc is not None:
+                if alpha is None:
+                    gen_chunk = gen_chunk.mul(gain_hwc)
+                else:
+                    gen_chunk.mul_(gain_hwc)
+                gen_chunk.clamp_(0.0, 1.0)
+            src_chunk = self._image_chunk(
+                source_equirect, start, end, B, H, W, device)
+            content = self._content_chunk(
+                outpaint_mask, start, end, B, H, W, device)
+            m = self._feather_content(content, feather_px, wrap_w)
 
-        out = src * m + gen * (1.0 - m)
+            # Build the blend directly in its final output slice. lerp_ is
+            # equivalent to gen*(1-m) + src*m and avoids two RGB temporaries.
+            dest = out[start:end]
+            dest.copy_(gen_chunk)
+            if dest.dtype == torch.float32:
+                dest.lerp_(src_chunk, m)
+            else:
+                dest.lerp_(src_chunk.to(dest.dtype), m.to(dest.dtype))
+            dest.clamp_(0.0, 1.0)
         if pbar:
             pbar.update(1)
-        return (out.clamp(0.0, 1.0).to(generated.dtype),)
+        return (out,)
 
 
 # ---------------------------------------------------------------------------

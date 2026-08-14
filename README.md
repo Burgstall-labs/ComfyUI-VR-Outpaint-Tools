@@ -196,6 +196,14 @@ This node fixes both in pixel space, after the final decode:
 
 Outputs the composited `IMAGE` batch.
 
+The node processes temporary image data in automatic pixel-bounded chunks. At
+3840×1920 it uses one frame per chunk, while tone matching and equalization are
+still fitted across the complete clip for temporal stability. The two input
+videos and the returned video batch must still coexist: one 3840×1920 float32
+RGB frame is 84.4 MiB, so that unavoidable three-batch floor is about 253 MiB
+per frame. Split very long clips into smaller IMAGE batches if those three
+batches alone exceed available RAM/VRAM.
+
 ## Notes
 
 - All nodes operate on ComfyUI's standard `(B, H, W, C)` IMAGE tensors,
