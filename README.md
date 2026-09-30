@@ -38,7 +38,6 @@ The example workflow used for these:
 - **[ComfyUI-Seamless-Equirectangular](https://github.com/Burgstall-labs/ComfyUI-Seamless-Equirectangular)** — seamless text-to-video 360° generation (no source footage) with the same equirectangular LoRA, seam, and pole techniques.
 - **[ComfyUI-Domemaster-Outpaint](https://github.com/Burgstall-labs/ComfyUI-Domemaster-Outpaint)** — companion pack for fulldome / planetarium delivery of the outpainted panorama (domemaster rendering with tilted-venue presets, square-hemisphere workflow).
 - **[Seamless-Equirectangular-LTX2.3-LoRA](https://huggingface.co/TheBurgstall/Seamless-Equirectangular-LTX2.3-LoRA)** — the LoRA the outpaint IC-LoRA pipeline is built around.
-- **[VR180 stereo design](docs/VR180_STEREO_DESIGN.md)** — CrossView-inspired dominant-eye → geometric reprojection → residual disocclusion completion, plus the optional 3DGS/4DGS stereo route.
 
 ## Install
 
